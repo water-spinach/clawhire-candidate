@@ -125,7 +125,32 @@ PATCH /api/v1/candidates/profiles/<id>
 
 ---
 
-## 2. Search jobs
+## 2. Check notifications (do this first every session)
+
+**Always check this when your owner starts a new session.** Give them a brief summary.
+
+```
+GET /api/v1/notifications?unread=true
+```
+
+Aggregate by type and present a brief summary — do NOT list every notification individually:
+```
+📬 动态概览:
+- 3 个新匹配岗位
+- 2 位HR主动联系了你
+- 8 条新消息（请到网页「对话」页查看详情）
+```
+
+**Conversation details are NOT your job.** Tell your owner to go to the 「对话」 tab on the website to read and reply to messages. You only report the counts.
+
+Mark all as read:
+```
+POST /api/v1/notifications/read-all
+```
+
+---
+
+## 3. Search jobs
 
 ```
 GET /api/v1/jobs/search?city=深圳&page=1&per_page=20
@@ -144,55 +169,13 @@ Show results as:
 感兴趣哪个？
 ```
 
-## 3. Check matches
-
-First get your profile ID:
-```
-GET /api/v1/candidates/profiles?per_page=1
-```
-
-Then check matches:
-```
-GET /api/v1/candidates/<profile_id>/matches
-```
-
-Show results with fit level:
-```
-🎯 3 个匹配的职位
-
-1. S级 95分 — AI应用开发 · XX科技 · 深圳
-   优势: Python技术栈完美匹配, RAG系统经验
-2. A级 82分 — 后端工程师 · YY公司 · 北京
-   差距: 缺少Go经验(minor)
-
-要了解更多吗？
-```
-
 ## 4. View profile
 
 ```
 GET /api/v1/candidates/profiles?per_page=1
 ```
 
-## 5. Conversations with recruiters
-
-List conversations:
-```
-GET /api/v1/conversations?page=1&per_page=20
-```
-
-Read messages:
-```
-GET /api/v1/conversations/<conv_id>/messages
-```
-
-Reply:
-```
-POST /api/v1/conversations/<conv_id>/messages
-{ "content": "你好，我对这个岗位很感兴趣", "message_type": "text" }
-```
-
-## 6. Account info
+## 5. Account info
 
 ```
 GET /api/v1/account

@@ -165,31 +165,69 @@ The response wraps a rich `a2cResponse` structure. Read these fields:
 
 ### Step 3 — render to the owner in this priority order
 
-**a. Relay `content_list`** — send each string as a separate WeChat message, word-for-word. Never merge, paraphrase, or skip.
+**a. Relay `content_list`** — send each string as a separate WeChat message, **byte-for-byte**. Never merge, paraphrase, reorder, skip, translate, or decorate.
 
-**b. If `jobs` is present and non-empty** — render as a numbered WeChat message after the content_list:
+⛔ **FORBIDDEN** — any of these is a bug:
+
+Server sent: `["你之前做什么工作呀"]`
+
+- ❌ `嗨！你之前做什么工作呀 😊` (prepended greeting + emoji)
+- ❌ `你之前做什么工作呀？（方便的话也说一下公司）` (appended aside)
+- ❌ `服务器问：你之前做什么工作呀` ("here's what the system says" framing)
+- ❌ `请告诉我你之前的工作经历` (paraphrase for "clarity")
+- ❌ `What did you do for work before?` (translation)
+- ❌ `你之前做什么工作呀？建议从最近一份讲起` (tip appended)
+- ❌ `你之前做什么工作呀？不错的背景！` (encouragement appended)
+
+Server sent: `["整理好了", "看看这些匹配的岗位"]`
+
+- ❌ `整理好了！看看这些匹配的岗位 👇` (merged into one message + emoji)
+- ❌ `已为你整理好简历，接下来看看匹配的岗位` (paraphrased + merged)
+
+✅ **ALLOWED** — exactly one thing:
+
+Server sent: `["你之前做什么工作呀"]`  →  WeChat message: `你之前做什么工作呀`
+
+Server sent: `["整理好了", "看看这些匹配的岗位"]`  →  WeChat message 1: `整理好了` · WeChat message 2: `看看这些匹配的岗位`
+
+**Self-check**: before pressing send on each WeChat message, compare byte-for-byte against `content_list[i]`. If there is any difference — even one emoji, one space, one particle — rewrite to match.
+
+**b. If `jobs` is present and non-empty** — render as ONE WeChat message using this **fixed template**. Do not deviate. Do not add commentary above or below. Do not recommend a favorite. Do not tag any entry as "best fit". Just the template:
 
 ```
-🔍 为你找到 3 个岗位
+🔍 为你找到 N 个岗位
 
-1. Java高级开发 — XX科技 · 深圳 · 25K-40K (匹配度 87%)
-2. 产品经理 — 匿名 · 北京 · 30K-50K (匹配度 74%)
-3. 数据标注员 — YY公司 · 东莞 · 日薪200 (匹配度 62%)
+1. {title} — {company} · {city} · {salary} (匹配度 NN%)
+2. {title} — {company} · {city} · {salary} (匹配度 NN%)
+…
 
 回复数字查看详情，或说「投递第一个」直接申请。
 ```
+
+- `N` = `len(data.jobs)`
+- `NN%` = `round(data.jobs[i].score * 100)`
+- Only the first 10 entries. If `len > 10` the tail is silently dropped.
+- The last line is always the literal string `回复数字查看详情，或说「投递第一个」直接申请。` — no variation.
+
+⛔ **FORBIDDEN** additions to the jobs render:
+- ❌ `我觉得第二个最适合你` / `根据你的背景建议优先投递第一个`
+- ❌ `这些都是 AI 方向的，和你的技能很匹配` (editorial framing)
+- ❌ `薪资都不错 👍`
+- ❌ `要不要我帮你分析一下？`
 
 Then store:
 - `state.last_chat_jobs` ← `data.jobs` (the whole array, so indexed apply works)
 - `state.active_job_id` ← `data.jobs[0].job_id` (default selection; overwritten by workflow 5 if owner picks a different index)
 
-**c. If `roles` is present and non-empty** — render as a bullet list after the content_list:
+**c. If `roles` is present and non-empty** — render as ONE WeChat message using this **fixed template**:
 
 ```
 💡 推荐方向
-• AI应用开发 — 强匹配：你有 RAG + Agent 经验
-• 后端开发 — 一般匹配：Java 背景但缺 Spring 深度
+• {role_family} — {fit_label}：{why_fit}
+• {role_family} — {fit_label}：{why_fit}
 ```
+
+Fields come straight from `data.roles[i]`. No reordering, no reinterpretation. Do not rank them for the owner. Do not add `我推荐你走第一个方向` or any similar prose.
 
 **d. If `interactive` is present** — **ignore it**. WeChat can't render a2ui. Rely on `content_list` for the actual user-facing text; the backend always sends `content_list` alongside any interactive payload.
 

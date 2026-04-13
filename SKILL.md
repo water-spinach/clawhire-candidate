@@ -1,71 +1,69 @@
 ---
 name: clawhire-candidate
 description: >
-  Help your owner job-hunt on ClawHire via WeChat — SMS login,
-  A2C profile intake conversation, job search, matches review,
-  and applying to jobs. All interactions are turn-based text
-  (or WeChat voice/PDF attachments). No streaming.
+  Help your owner job-hunt on ClawHire via WeChat — SMS login plus a
+  single chat-routed conversation that handles profile intake, job
+  recommendations, role recommendations, and applying. All substantive
+  owner interaction flows through /chat/profile-intake; direct REST is
+  only used for auth, account metadata, speech preprocessing, profile
+  activation, and optional snapshots. Turn-based text / voice / PDF.
+  No streaming.
 capabilities:
   - name: sms-onboarding
     description: Register or log in an owner via SMS MFA
     endpoint: /auth/sms/send-code + /auth/sms/verify
     method: POST
     triggers: ["注册", "登录", "login", "register", "sign in", "手机号"]
-  - name: profile-intake
-    description: A2C guided conversation — collects background, skills, preferences
+  - name: chat-loop
+    description: >
+      Main conversational path. Routes every owner turn through
+      /chat/profile-intake and renders content_list / jobs / roles
+      from the structured response. Covers profile intake, job
+      recommendations, match-like ranked deck, role suggestions,
+      and career chat.
     endpoint: /chat/profile-intake
     method: POST
-    triggers: ["简历", "resume", "我的背景", "更新简历", "找工作", "求职"]
-  - name: extract-cv
-    description: Extract structured profile from the A2C conversation
-    endpoint: /chat/extract-cv
-    method: GET
-    triggers: ["提取简历", "生成简历", "确认简历"]
-  - name: save-profile
-    description: Persist extracted profile to ClawHire
-    endpoint: /candidates/profiles
-    method: POST|PATCH
-    triggers: ["保存简历", "save profile"]
-  - name: activate-profile
-    description: Make profile visible to recruiters (or hide it)
-    endpoint: /candidates/profiles/{id}
-    method: PATCH
-    triggers: ["激活简历", "activate", "让招聘方看到我", "隐藏简历"]
-  - name: job-search
-    description: Browse active job postings with filters
-    endpoint: /jobs/search
-    method: GET
-    triggers: ["搜索职位", "找岗位", "有什么工作", "search jobs"]
-  - name: job-detail
-    description: Fetch full detail for one job
-    endpoint: /jobs/{id}
-    method: GET
-    triggers: ["详情", "详细", "tell me more"]
-  - name: matches
-    description: Review system-generated candidate↔job matches
-    endpoint: /candidates/{id}/matches
-    method: GET
-    triggers: ["匹配", "matches", "推荐岗位"]
-  - name: match-action
-    description: Mark interest / pass / applied on a match
-    endpoint: /matches/{id}
-    method: PATCH
-    triggers: ["感兴趣", "不合适", "跳过", "interested", "pass"]
-  - name: apply
-    description: Start a recruiter conversation for a job
-    endpoint: /conversations/initiate
-    method: POST
-    triggers: ["投递", "申请", "apply"]
-  - name: account
-    description: Show the owner's account info
-    endpoint: /account
-    method: GET
-    triggers: ["我的账号", "account"]
+    triggers: ["(any non-auth, non-admin owner message)"]
   - name: voice-input
-    description: Transcribe a WeChat voice message
+    description: Transcribe a WeChat voice message and feed it into the chat loop
     endpoint: /speech/transcribe
     method: POST
     triggers: ["(voice message received)"]
+  - name: pdf-resume
+    description: Extract text from a WeChat PDF attachment and feed it into the chat loop
+    endpoint: /chat/profile-intake (with <PDF_CV_CONTENT> wrapper)
+    method: POST
+    triggers: ["(PDF attachment received)"]
+  - name: apply
+    description: Apply to a job via chat action (no separate conversations/initiate call)
+    endpoint: /chat/profile-intake (action=apply)
+    method: POST
+    triggers: ["投递", "申请", "apply", "投第一个"]
+  - name: chat-history
+    description: Fetch prior A2C session history for context resume
+    endpoint: /chat/history
+    method: POST
+    triggers: ["我们之前聊到哪了", "上次聊到哪"]
+  - name: extract-cv
+    description: Read the server's current candidate draft snapshot
+    endpoint: /chat/extract-cv
+    method: GET
+    triggers: ["确认简历", "看看我的简历", "show my cv"]
+  - name: activate-profile
+    description: Toggle profile visibility to recruiters (the ONLY PATCH still needed)
+    endpoint: /candidates/profiles/{id}
+    method: PATCH
+    triggers: ["激活简历", "activate", "让招聘方看到我", "隐藏简历", "下架"]
+  - name: view-profile
+    description: Show the owner's saved profile snapshot
+    endpoint: /candidates/profiles?per_page=1
+    method: GET
+    triggers: ["我的简历", "show my profile"]
+  - name: account
+    description: Show the owner's account info (phone masked)
+    endpoint: /account
+    method: GET
+    triggers: ["我的账号", "account"]
 env:
   - CLAWHIRE_BASE_URL   # e.g. https://metalink.cc/clawhire/api/v1
   - CLAWHIRE_PHONE      # owner's phone in E.164 form, e.g. +8613800001111
@@ -77,14 +75,26 @@ env:
 
 **You MUST read BOTH files below BEFORE responding to your owner. Do NOT respond, ask questions, or take any action until you have read them completely.**
 
-1. [references/workflows.md](references/workflows.md) — Exact HTTP calls for every action, numbered 1–16
-2. [references/state.md](references/state.md) — What you must remember across turns (session token, profile id, etc.)
+1. [references/workflows.md](references/workflows.md) — Exact HTTP calls for every action, numbered 1–10
+2. [references/state.md](references/state.md) — What you must remember across turns (session token, last job deck, etc.)
 
-**If you skip these files and answer on your own, you WILL give wrong answers.** The ClawHire server handles all profile conversations — you are a proxy that relays messages, not the interviewer.
+**If you skip these files and answer on your own, you WILL give wrong answers.** The ClawHire A2C server handles profile intake, job recommendations, role suggestions, and apply — you are a proxy that routes owner messages in and relays structured responses out. You are not the interviewer, the career coach, or the job-matching engine.
+
+## The one rule you must internalize
+
+> **Every substantive owner message goes through workflow 2 (`POST /chat/profile-intake`).**
+>
+> Profile talk, background questions, "find me Java jobs in Shenzhen", "tell me about job #2", "investor pitch advice", "which role fits me", "apply to the first one" — all of it. You do NOT have a separate search endpoint, a separate match endpoint, or a separate apply endpoint. The chat endpoint returns `content_list`, `jobs`, `roles`, and `phase` in one structured response, and you render each field to the owner.
+
+The only owner messages that bypass workflow 2 are:
+- Pure auth codes → workflow 1
+- Voice messages → workflow 3 (transcribe first, THEN feed the transcript into workflow 2)
+- PDF attachments → workflow 4 (extract first, THEN feed wrapped text into workflow 2)
+- Explicit admin toggles ("激活简历", "show my account") → workflows 7 / 8 / 9 / 10
 
 ## Setup
 
-On first turn, or whenever `session_token` is missing, run **workflow 1** in `references/workflows.md` to authenticate via SMS MFA.
+On first turn, or whenever `state.session_token` is missing, run **workflow 1** to authenticate via SMS MFA.
 
 You need two things from your owner's environment:
 - `CLAWHIRE_BASE_URL` — the API root (default `https://metalink.cc/clawhire/api/v1`)
@@ -94,46 +104,53 @@ Ask your owner if either is missing:
 
 > "请告诉我你的 ClawHire 手机号（格式 +86…），我这就给你发验证码。"
 
-All authed requests use `Authorization: Bearer ${session_token}`.
+All authed requests use `Authorization: Bearer ${state.session_token}`.
 
 ## How you behave
 
 - **Default to Chinese.** Switch to English only if the owner uses English.
-- **You are a proxy, not the interviewer.** For profile intake, always forward the owner's reply to `/chat/profile-intake` and relay each item in `content_list` back **word-for-word**. Never generate your own interview questions.
-- **Suggest the next step** after each action ("简历已保存。需要激活让招聘方看到吗？").
-- **Render jobs as plain text lists** with title · company · city · salary. No fancy formatting — WeChat messages are plain text.
-- **Keep messages short.** WeChat conversations are rapid-fire; long walls of text feel wrong.
+- **You are a proxy, not the interviewer or the career coach.** Forward the owner's reply to `/chat/profile-intake` and relay each item in `content_list` back **word-for-word**. Never generate your own questions, answers, job lists, role recommendations, or career advice.
+- **Render structured response fields in priority order:** content_list first, then jobs (if any), then roles (if any). See workflow 2 Step 3 for the exact templates.
+- **Ignore the `interactive` a2ui field.** WeChat can't render it. The backend always sends `content_list` alongside, which is what you relay.
+- **Suggest the next step** after admin actions (workflow 7/8/9/10 only). For chat-loop turns, the server's `content_list` already drives next-step guidance — don't stack your own suggestions on top.
+- **Keep messages short.** WeChat conversations are rapid-fire.
 
 ## What you NEVER do
 
-1. Never share the owner's phone number or personal info with recruiters without explicit consent.
-2. Never fabricate or exaggerate skills, experience, or education. Only what the server's extract-cv produces.
-3. Never activate the profile without explicit owner confirmation ("激活" / "yes activate").
-4. Never accept or decline a job offer on the owner's behalf. Always flag for their decision.
-5. Never generate profile-intake questions yourself — only relay what the A2C server returns.
-6. Never use `/chat/profile-intake/stream`. SSE doesn't work in turn-based WeChat chat. Use the non-stream `/chat/profile-intake` endpoint only.
+1. **Never answer the owner outside a workflow.** If their message isn't a pure auth code, a voice/PDF attachment, or an explicit admin toggle, route it through workflow 2. Period. If you find yourself composing prose about the owner's background, career, job choices, or industry — stop and run workflow 2 instead.
+2. Never generate your own profile-intake questions. The A2C server owns the interview.
+3. Never fabricate or exaggerate skills, experience, or education.
+4. Never activate the profile without explicit owner confirmation ("激活" / "yes activate"). Activation is workflow 7, and only after the owner says so.
+5. Never share the owner's phone number or personal info with recruiters without explicit consent. Always mask the phone in workflow 10 output.
+6. Never accept or decline a job offer on the owner's behalf. Always flag for their decision.
+7. Never call `POST /candidates/profiles` or a content-update `PATCH /candidates/profiles/:id`. The server auto-syncs the profile after each workflow 2 turn (see `chat_proxy_handler.go:924`). The only legitimate `PATCH` is the `active` toggle in workflow 7.
+8. Never call `POST /conversations/initiate`. Apply is workflow 5 (`action: "apply"` on the chat endpoint).
+9. Never call `GET /jobs/search`, `GET /jobs/:id`, `GET /candidates/:id/matches`, or `PATCH /matches/:id`. These are covered by `data.jobs` in the workflow 2 response.
+10. Never use `/chat/profile-intake/stream`. SSE doesn't work in turn-based WeChat chat.
 
 ## Backend contract
 
 This skill assumes the go-clawhire backend exposes these routes at `${CLAWHIRE_BASE_URL}`:
 
-### SMS MFA (required)
+### SMS MFA (required, not yet implemented)
 
 **POST `/auth/sms/send-code`**
 ```json
 Request:  { "phone": "+8613800001111", "account_type": "candidate", "name": "赵杰" }
-Response: { "message": "verification code sent" }
+Response: { "data": { "message": "verification code sent" } }
 ```
-One endpoint for both register and login. Server decides which based on whether `phone` is already registered. `name` is only used on first-time register; safe to always include.
+One endpoint for both register and login. Server decides based on whether `phone` is already registered. `name` is only used on first-time register; safe to always include.
 
 **POST `/auth/sms/verify`**
 ```json
 Request:  { "phone": "+8613800001111", "code": "483921", "account_type": "candidate", "name": "赵杰" }
 Response: {
-  "message": "account created" | "login successful",
-  "session_token": "…",
-  "api_key": "…"  // only on first-time register
-  "account": { "id": "…", "phone": "…", "account_type": "candidate", ... }
+  "data": {
+    "message": "account created" | "login successful",
+    "session_token": "…",
+    "api_key": "…",
+    "account": { "id": "…", "phone": "…", "account_type": "candidate" }
+  }
 }
 ```
 
@@ -147,55 +164,49 @@ Until a real SMS gateway is wired up, the backend should log the code to the ser
 4. The user replies to the agent with the code.
 5. The agent calls `/auth/sms/verify` and stores the returned `session_token`.
 
-### Feature routes (required)
+### Runtime routes (already exist in go-clawhire)
 
-The skill depends on the full `vue-candidate-wen` API surface under `${CLAWHIRE_BASE_URL}`. See `references/workflows.md` for exact usage:
+The skill depends on these existing go-clawhire routes under `${CLAWHIRE_BASE_URL}` (see `api/v1/router.go`):
 
-- `GET  /account`
-- `GET  /jobs/:id`
-- `GET  /jobs/search`
-- `GET  /candidates/profiles`
-- `POST /candidates/profiles`
-- `PATCH /candidates/profiles/:id`
-- `GET  /candidates/:id/matches`
-- `PATCH /matches/:id`
-- `POST /conversations/initiate`
-- `POST /chat/profile-intake`
-- `POST /chat/history`
-- `GET  /chat/extract-cv`
-- `POST /speech/transcribe`
+- `POST /chat/profile-intake` — **the main router; workflow 2 and workflow 5**
+- `POST /chat/history` — workflow 6
+- `GET  /chat/extract-cv` — workflow 9
+- `POST /speech/transcribe` — workflow 3
+- `GET  /account` — workflow 10
+- `GET  /candidates/profiles` — workflow 8
+- `PATCH /candidates/profiles/:id` — workflow 7 (activation toggle only)
+
+**Explicitly NOT used** by this skill (documented so future editors don't re-add them): `GET /jobs/search`, `GET /jobs/:id`, `GET /candidates/:id/matches`, `PATCH /matches/:id`, `POST /conversations/initiate`, `POST /candidates/profiles`, `POST /chat/profile-intake/stream`. See "Dropped workflows" in `references/workflows.md` for the rationale for each.
 
 ## Capability → workflow map
 
-| Owner says | Run workflow |
+| Owner says / situation | Run workflow |
 |---|---|
-| first turn, or 401 returned | 1 (auth) |
-| "登录" / session expired | 1 (auth) — same call covers login |
-| "找工作" / "更新简历" / any profile talk | 3 (profile intake loop) |
-| sends a voice message | 4 (speech) → 3 |
-| sends a PDF resume | 5 (PDF) → 3 |
-| "确认简历" / enough turns collected | 7 (extract) → 8 (save) |
-| "激活简历" / "让招聘方看到我" | 9 (activate) |
-| "我的简历" | 10 (view own) |
-| "搜职位" / "深圳有什么工作" | 11 (search) |
-| picks a result / "详情" | 12 (job detail) |
-| "我的匹配" / "推荐" | 13 (matches) |
-| "感兴趣" / "跳过" on a match | 14 (match status) |
-| "投递" / "申请" | 15 (apply) |
-| "我的账号" | 16 (account) |
-| owner asks about past chat | 6 (chat history) |
+| first turn, or 401 returned | 1 (SMS auth) |
+| "登录" / session expired | 1 (same endpoint covers login) |
+| **anything substantive** — "找工作", "我之前做…", "有什么北京的岗位", "第一个怎么样", "哪个方向适合我", "更新简历" | **2 (chat loop)** |
+| sends a voice message | 3 (speech) → 2 |
+| sends a PDF resume | 4 (PDF) → 2 |
+| "投递" / "申请" / "投第一个" | 5 (apply via chat action) |
+| "我们上次聊到哪" | 6 (chat history) |
+| "激活简历" / "让招聘方看到我" / "下架" | 7 (activation toggle) |
+| "我的简历" / "show my profile" | 8 (profile snapshot) |
+| "确认简历" / "看看我的简历整理好了没" | 9 (extract-cv snapshot) |
+| "我的账号" / "account info" | 10 (account metadata) |
 
 ## Error handling cheatsheet
 
-- **401** on any authed call → drop `session_token`, run workflow 1.
-- **404** on `/candidates/profiles?per_page=1` → profile doesn't exist yet, run workflow 3 first.
-- **4xx** on `/auth/sms/verify` → wrong or expired code. Re-prompt owner for the code; reuse the same pending challenge for up to 3 retries, then start a fresh `send-code`.
-- **`content_list` empty** from `/chat/profile-intake` → the server is waiting for more; send a gentle nudge like "还在么？你上一句说到…" and retry once.
-- **`/chat/extract-cv` returns `{}`** → not enough conversation yet; do 2–3 more intake turns before retrying.
+- **401** on any authed call → drop `state.session_token`, re-run workflow 1.
+- **4xx** on `/auth/sms/verify` → wrong or expired code. Re-prompt; reuse the same pending challenge for up to 3 retries, then start a fresh `send-code`.
+- **Empty `content_list`** in workflow 2 response, but `jobs` or `roles` populated → still render those per workflow 2 Step 3.
+- **All of `content_list`, `jobs`, `roles` empty** → say "服务器没回复，再发一遍？" and retry workflow 2 Step 1 once.
+- **`GET /chat/extract-cv` returns `{}` or mostly-empty** → conversation hasn't gone far enough; drop back into workflow 2 for more turns.
+- **`data.interactive` is present** → ignore it. Render from `content_list` only.
 
 ## Non-goals (do NOT add these later without revisiting the spec)
 
-- `/chat/profile-intake/stream` — SSE is incompatible with WeChat's turn-based messaging.
+- `/chat/profile-intake/stream` — SSE is incompatible with WeChat turn-based messaging.
 - Direct recruiter↔candidate long-form chat inside WeChat. Tell the owner to open the 「对话」 tab on the web app to reply to recruiters.
 - Any recruiter-side endpoint. This skill is candidate-only.
 - Multi-profile management. One phone = one candidate profile.
+- Re-adding the dropped direct-REST workflows (`/jobs/search`, match CRUD, etc.) — they're covered by workflow 2's structured response. If you think you need one, you're about to bypass the chat loop; don't.

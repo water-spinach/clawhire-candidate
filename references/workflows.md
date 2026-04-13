@@ -1,22 +1,24 @@
 # Workflows
 
-Every runtime HTTP call the `clawhire-candidate` skill makes, numbered 1–16.
+Every runtime HTTP call the `clawhire-candidate` skill makes, numbered 1–10.
+
+**Core principle:** the go-clawhire `/chat/profile-intake` endpoint is a **full candidate router**, not just a profile collector. Its response carries `content_list`, `jobs` (ranked + enriched), `roles`, `candidate_profile` (auto-synced to DB by the server), `phase`, and an optional `interactive` a2ui payload. **Every owner turn — job search, apply, profile talk, role questions — routes through workflow 2.** Direct REST calls are used only for the five things the chat endpoint can't do: SMS auth, account metadata, voice preprocessing, profile activation toggle, and optional snapshot reads.
 
 **Conventions used throughout this file:**
 - `${BASE}` = `${CLAWHIRE_BASE_URL}` env var, e.g. `https://metalink.cc/clawhire/api/v1`
-- Every authed call sends `Authorization: Bearer ${session_token}` and `Content-Type: application/json` unless noted.
-- State keys (`session_token`, `profile_id`, etc.) are defined in [state.md](state.md).
-- When a step says "say to owner", send that text as a WeChat message. If `content_list` has multiple items, send each as a **separate** WeChat message.
+- Every authed call sends `Authorization: Bearer ${state.session_token}` and `Content-Type: application/json` unless noted.
+- State keys are defined in [state.md](state.md).
+- When a step says "relay to owner", send each item in `content_list` as a **separate** WeChat message.
 
 ---
 
-## 1. First-time onboarding / returning login (SMS MFA)
+## 1. SMS MFA onboarding / login
 
 **When:** first turn of a session, or any authed call returns 401.
 
-**Trigger phrases:** "登录", "注册", "login", "register", or implicit (no `session_token`).
+**Trigger phrases:** "登录", "注册", "login", "register", or implicit (no `state.session_token`).
 
-### Step 1 — ask for the phone (if not in env)
+### Step 1 — collect phone
 
 If `CLAWHIRE_PHONE` is empty, say to owner:
 
@@ -37,6 +39,8 @@ Content-Type: application/json
 }
 ```
 
+One endpoint covers both register and login — the server decides based on whether `phone` is already registered.
+
 Expected response:
 ```json
 { "data": { "message": "verification code sent" } }
@@ -46,11 +50,11 @@ Say to owner:
 
 > "验证码已发送到 +86138****1111。请把收到的 6 位数字发给我。"
 
-(During local testing with the mock SMS provider, tell the owner to check the go-clawhire server log for `[SMS_MOCK]` — see `SKILL.md` → Mock SMS provider.)
+(Local testing note: the mock provider logs the code via `slog.Info("[SMS_MOCK] to=%s code=%s")`. Tell the owner to grep the server log if they run go-clawhire themselves.)
 
 ### Step 3 — verify
 
-When the owner sends a 6-digit code, call:
+When the owner sends a 6-digit code:
 
 ```
 POST ${BASE}/auth/sms/verify
@@ -84,28 +88,22 @@ Store:
 
 Say to owner:
 
-> "✅ 登录成功。要更新简历还是看看有什么新岗位？"
+> "✅ 登录成功。聊聊你最近的求职情况吧？"
+
+Then immediately transition to workflow 2 with whatever the owner says next.
 
 ### Step 4 — handle errors
 
-- 4xx from `/auth/sms/verify` → wrong/expired code. Say: "验证码不对，再发一次给我？" Allow up to 3 retries on the same challenge, then re-run Step 2 (fresh `send-code`).
+- 4xx from `/auth/sms/verify` → wrong/expired code. Say: "验证码不对，再发一次给我？" Allow up to 3 retries on the same challenge, then re-run Step 2.
 - 5xx → apologize and suggest retry in a minute.
 
 ---
 
-## 2. Returning login
+## 2. Main chat loop — ROUTE EVERY OWNER TURN THROUGH HERE
 
-Same as workflow 1. The option-B `/auth/sms/send-code` endpoint collapses register and login — the server decides based on whether `${state.phone}` is already registered. No separate workflow.
+**When:** any owner message that is not a pure auth code, a voice/PDF attachment (those preprocess through workflows 3/4 first), or an explicit admin toggle (workflow 7). **This is the default path for everything — profile talk, background questions, "find me jobs", "apply to the first one", match review, role questions, career chat.**
 
----
-
-## 3. Profile intake (A2C conversation loop) — MAIN FLOW
-
-**When:** owner wants to build or update their profile, or says anything about their background, skills, or job preferences.
-
-**Trigger phrases:** "简历", "找工作", "更新简历", "我之前做…", "我会…".
-
-**⛔ You are a PROXY here, not the interviewer. Do NOT generate your own questions about background, skills, or preferences. The server does that.**
+**⛔ You are a PROXY. Do NOT generate your own answers to the owner's substantive questions — forward them to the server and render what it returns. Your only freeform prose is: short acknowledgements ("好的"), status messages ("正在搜索…"), and the fixed templates defined in workflows 1, 5, 7–10.**
 
 ### Step 1 — forward the owner's message
 
@@ -121,54 +119,106 @@ Content-Type: application/json
 
 The backend derives the session ID from the account — do NOT send one.
 
-Expected response:
+### Step 2 — parse the structured response
+
+The response wraps a rich `a2cResponse` structure. Read these fields:
+
 ```json
 {
   "data": {
-    "content_list": [
-      "你好~想了解一下你的求职意向",
-      "之前做什么工作呀"
+    "session_id": "clawhire-a2c-acc_abc",
+    "agent_type": "a2c",
+    "content_list": ["…", "…"],
+    "phase": "intake" | "job_deck" | "apply" | ...,
+    "reasoning_content": "(ignore — debug only)",
+    "candidate_profile": {
+      "name": "…", "background_summary": "…", "skills": [],
+      "desired_roles": [], "preferred_city": "…", "desired_salary": "…"
+    },
+    "profile_changed": true|false,
+    "jobs": [
+      {
+        "job_id": "job_1",
+        "title": "Java高级开发",
+        "company": "XX科技",
+        "city": "深圳",
+        "salary": "25K-40K",
+        "score": 0.87,
+        "summary": "…",
+        "matches": [],
+        "gaps": [],
+        "detail": { /* full Job object */ }
+      }
     ],
-    "agent_type": "a2c"
+    "roles": [
+      {
+        "id": "role_1",
+        "role_family": "AI应用开发",
+        "fit_label": "strong",
+        "why_fit": "…"
+      }
+    ],
+    "interactive": { /* a2ui payload — IGNORE in WeChat */ }
   }
 }
 ```
 
-### Step 2 — relay each `content_list` item as a SEPARATE WeChat message
+### Step 3 — render to the owner in this priority order
 
-If `content_list` has 3 items, send 3 WeChat messages. Do NOT merge them, do NOT paraphrase, do NOT add your own commentary.
+**a. Relay `content_list`** — send each string as a separate WeChat message, word-for-word. Never merge, paraphrase, or skip.
 
-### Step 3 — wait for the owner's next message, then loop back to Step 1
+**b. If `jobs` is present and non-empty** — render as a numbered WeChat message after the content_list:
 
-The A2C server will naturally collect, over multiple turns:
-- name, age, gender, phone
-- education, school, major
-- work history and experience years
-- skills and certifications
-- desired roles, industries, cities
-- salary expectations
-- availability and deal-breakers
+```
+🔍 为你找到 3 个岗位
 
-After ~4+ exchanges the server will start summarizing. When it does, proceed to **workflow 7 (extract CV)**.
+1. Java高级开发 — XX科技 · 深圳 · 25K-40K (匹配度 87%)
+2. 产品经理 — 匿名 · 北京 · 30K-50K (匹配度 74%)
+3. 数据标注员 — YY公司 · 东莞 · 日薪200 (匹配度 62%)
+
+回复数字查看详情，或说「投递第一个」直接申请。
+```
+
+Then store:
+- `state.last_chat_jobs` ← `data.jobs` (the whole array, so indexed apply works)
+- `state.active_job_id` ← `data.jobs[0].job_id` (default selection; overwritten by workflow 5 if owner picks a different index)
+
+**c. If `roles` is present and non-empty** — render as a bullet list after the content_list:
+
+```
+💡 推荐方向
+• AI应用开发 — 强匹配：你有 RAG + Agent 经验
+• 后端开发 — 一般匹配：Java 背景但缺 Spring 深度
+```
+
+**d. If `interactive` is present** — **ignore it**. WeChat can't render a2ui. Rely on `content_list` for the actual user-facing text; the backend always sends `content_list` alongside any interactive payload.
+
+**e. If `profile_changed` is true** — the server auto-saved the owner's profile. No action needed from you; do NOT call `POST /candidates/profiles`. If the owner asks "简历存了吗?", say "已帮你保存了". Optionally run workflow 8 to show them the current snapshot.
+
+**f. If `candidate_profile` is present** — treat as reference only. The actual DB write has already happened; this is just the server telling you what it extracted. Do NOT echo it back unless the owner explicitly asks.
 
 ### Step 4 — handle empty content_list
 
-If `content_list` is empty or `content_list: null`, say to owner: "还在么？你上一句说到…" and retry workflow 3 step 1 once. If still empty, tell owner: "服务器好像没反应，稍后再聊？"
+If `content_list` is empty/null but `jobs` or `roles` is populated, still render them per Step 3. If all three are empty, say to owner: "服务器没回复，再发一遍？" and retry Step 1 once.
+
+### Step 5 — loop
+
+Wait for the owner's next message, then go back to Step 1. Every subsequent turn of substantive conversation follows this same loop.
 
 ---
 
-## 4. WeChat voice message → transcribe → feed profile-intake
+## 3. Voice message → transcribe → feed chat loop
 
-**When:** WeChat delivers an audio message to the agent.
+**When:** WeChat delivers an audio message.
 
-### Step 1 — transcribe the audio
+### Step 1 — transcribe
 
 ```
 POST ${BASE}/speech/transcribe
 Authorization: Bearer ${state.session_token}
 Content-Type: multipart/form-data
 
-audio=<voice-input.wav or .amr blob>
+audio=<voice.wav or .amr blob>
 ```
 
 Expected response:
@@ -182,21 +232,23 @@ Expected response:
 }
 ```
 
-### Step 2 — feed the transcript into workflow 3
+### Step 2 — feed `data.text` into workflow 2 Step 1
 
-Use `data.text` as the `user_input` and run workflow 3 Step 1. From the owner's perspective the voice message Just Works as if they typed it.
+Use the transcript as `user_input`. From the owner's perspective the voice message works exactly like typing.
 
 ---
 
-## 5. WeChat PDF resume → extract → feed profile-intake
+## 4. PDF resume → extract → feed chat loop
 
-**When:** WeChat delivers a PDF attachment to the agent.
+**When:** WeChat delivers a PDF attachment.
 
-### Step 1 — extract text from the PDF
+### Step 1 — extract PDF text
 
-Use openclaw's PDF extraction capability (not a ClawHire endpoint) to get the plain text of the resume.
+Use openclaw's PDF extraction capability (not a ClawHire endpoint) to get the resume's plain text.
 
-### Step 2 — wrap and forward to profile-intake
+### Step 2 — wrap and feed workflow 2 Step 1
+
+Send the extracted text as `user_input` wrapped in `<PDF_CV_CONTENT>…</PDF_CV_CONTENT>`:
 
 ```
 POST ${BASE}/chat/profile-intake
@@ -208,13 +260,59 @@ Content-Type: application/json
 }
 ```
 
-The `<PDF_CV_CONTENT>…</PDF_CV_CONTENT>` tag tells the A2C backend to treat this as a resume dump instead of a conversational reply. Relay the `content_list` response as usual.
+The tag tells the A2C backend to treat this as a resume dump instead of a conversational reply. Then render the response exactly as workflow 2 Step 3. The server will auto-extract and save the profile (`profile_changed: true`).
 
 ---
 
-## 6. Load prior chat history
+## 5. Apply to a job (chat-routed)
 
-**When:** owner asks "我们之前聊到哪了" or you want to resume context after a session break.
+**When:** owner says "投递", "申请", "apply", "投第一个" — either directly after a `jobs` list from workflow 2 (most common), or referencing a specific `job_id`.
+
+**Do NOT call `/conversations/initiate` directly.** The chat endpoint handles apply via an `action` field, and the server enriches + persists everything server-side.
+
+### Step 1 — resolve the target job
+
+- If the owner said a number ("第一个", "投第二个") → `state.last_chat_jobs[n-1]`.
+- If no index → use `state.active_job_id` (set by the latest workflow 2 render).
+- If neither is set → tell the owner "没看到你在看哪个岗位，先让我给你推荐几个？" and drop back to workflow 2.
+
+Let `job = state.last_chat_jobs[n-1]` (or the matching entry).
+
+### Step 2 — send the apply action to the chat endpoint
+
+```
+POST ${BASE}/chat/profile-intake
+Authorization: Bearer ${state.session_token}
+Content-Type: application/json
+
+{
+  "user_input": "",
+  "action": "apply",
+  "job_id": "${job.job_id}",
+  "job_title": "${job.title}",
+  "job_company": "${job.company}"
+}
+```
+
+Note: `user_input` is intentionally empty — the backend explicitly permits `action` without `user_input` (see `chat_proxy_handler.go:525`). The server also looks up missing `job_title`/`job_company` from the DB if you leave them blank, so sending just `job_id` works too.
+
+### Step 3 — render the response
+
+Same as workflow 2 Step 3. The server's `content_list` will typically include the confirmation message ("已为你发起求职申请…"). Relay it verbatim.
+
+Then say:
+
+> "招聘方会在 ClawHire 收到你的简历。他们回消息后，请到网页端「对话」页查看并回复 —— WeChat 里我只能帮你投递。"
+
+### Step 4 — clear active job
+
+Clear `state.active_job_id`. Keep `state.last_chat_jobs` in case the owner wants to apply to another one from the same list.
+
+---
+
+## 6. Resume prior chat history
+
+**When:** owner asks "我们之前聊到哪了" or you want context after a session break.
 
 ```
 POST ${BASE}/chat/history
@@ -224,133 +322,30 @@ Content-Type: application/json
 { "agent_type": "a2c" }
 ```
 
-Expected response:
+Expected response (sanitized by backend, see `chat_proxy_handler.go:1094`):
 ```json
 {
   "data": {
-    "messages": [
-      { "role": "user", "content": "…" },
-      { "role": "assistant", "content": "…" }
-    ]
+    "messages": [ { "role": "user", "content": "…" }, { "role": "assistant", "content": "…" } ],
+    "turn_state": { "latest_job_deck": [] },
+    "updated_at": "2026-04-13T…"
   }
 }
 ```
 
-Use this to reconstruct where the profile intake left off. Do NOT re-send the history to `/chat/profile-intake` — the server already has it. Just use it locally to remind yourself (and the owner, if asked) of context.
+If `turn_state.latest_job_deck` is present, the backend has already enriched each job with sanitized `detail` and stripped recruiter-only fields. You can reuse it to repopulate `state.last_chat_jobs` without calling workflow 2.
+
+Do NOT re-send the history as `user_input` — the server already has it server-side.
 
 ---
 
-## 7. Extract structured CV
+## 7. Activate / deactivate profile
 
-**When:** the profile intake has gone on for 4+ owner replies and the server has started asking confirming/summary questions, or the owner says "确认简历".
+**When:** owner explicitly says "激活", "让招聘方看到我", "yes activate", "隐藏", "下架".
 
-```
-GET ${BASE}/chat/extract-cv
-Authorization: Bearer ${state.session_token}
-```
+**Only direct REST path left for this — the chat endpoint does not toggle activation. Only run after explicit owner confirmation.**
 
-Expected response:
-```json
-{
-  "data": {
-    "name": "赵杰",
-    "education": "本科",
-    "school": "XX大学",
-    "major": "计算机",
-    "experience_years": 3,
-    "skills": ["Python", "RAG", "Agent"],
-    "certifications": [],
-    "desired_roles": ["AI应用开发"],
-    "desired_industries": ["互联网"],
-    "desired_cities": ["深圳"],
-    "desired_salary": "25K",
-    "available_date": "immediately",
-    "work_history": [],
-    "summary": "…",
-    "city": "深圳"
-  }
-}
-```
-
-Store the whole object as `state.latest_cv_snapshot`.
-
-Present the summary to the owner for confirmation:
-
-> "帮你整理好了：
-> 📋 姓名：赵杰
-> 🎓 本科 XX大学 计算机
-> 💼 3年经验，Python / RAG / Agent
-> 🎯 意向：AI应用开发，深圳，25K
-> 看着对吗？我帮你存进简历库。"
-
-If `data` is empty `{}`, say "咱们再多聊几句吧，我还没完全了解你" and do 2–3 more turns of workflow 3 before retrying.
-
-On confirmation (or owner correction), proceed to **workflow 8**.
-
----
-
-## 8. Save profile to ClawHire
-
-**When:** owner confirms the extracted CV in workflow 7.
-
-### Case A — no existing profile (`state.profile_id` is empty)
-
-```
-POST ${BASE}/candidates/profiles
-Authorization: Bearer ${state.session_token}
-Content-Type: application/json
-
-{
-  "name":                "${snapshot.name}",
-  "summary":             "${snapshot.summary}",
-  "city":                "${snapshot.city}",
-  "education":           "${snapshot.education}",
-  "school":              "${snapshot.school}",
-  "major":               "${snapshot.major}",
-  "total_experience_yrs": ${snapshot.experience_years},
-  "skills":              ${snapshot.skills},
-  "certifications":      ${snapshot.certifications},
-  "desired_roles":       ${snapshot.desired_roles},
-  "desired_industries":  ${snapshot.desired_industries},
-  "desired_cities":      ${snapshot.desired_cities},
-  "desired_salary":      "${snapshot.desired_salary}",
-  "available_date":      "${snapshot.available_date}",
-  "work_history":        ${snapshot.work_history},
-  "job_status":          "open_to_offers",
-  "custom_tags":         ${snapshot.skills}
-}
-```
-
-Expected response:
-```json
-{ "data": { "id": "prof_abc", "active": false } }
-```
-
-Store `state.profile_id` ← `data.id`.
-
-### Case B — existing profile
-
-```
-PATCH ${BASE}/candidates/profiles/${state.profile_id}
-Authorization: Bearer ${state.session_token}
-Content-Type: application/json
-
-{ ...same fields... }
-```
-
-Say to owner:
-
-> "✅ 简历已保存。要激活让招聘方看到吗？"
-
-Then wait for explicit confirmation before running workflow 9.
-
----
-
-## 9. Activate / deactivate profile
-
-**When:** owner explicitly says "激活", "让招聘方看到我", "yes activate" (or "隐藏", "下架").
-
-**Only run this after explicit owner confirmation. Never activate implicitly.**
+Requires `state.profile_id`. If empty, run workflow 8 first to fetch it.
 
 ### Activate
 
@@ -378,9 +373,9 @@ Say: "✅ 简历已下架，招聘方搜不到你了。"
 
 ---
 
-## 10. View own profile
+## 8. View own profile snapshot
 
-**When:** owner asks "我的简历", "show my profile".
+**When:** owner asks "我的简历", "show my profile", or you need to fetch `state.profile_id` for workflow 7.
 
 ```
 GET ${BASE}/candidates/profiles?per_page=1
@@ -397,190 +392,56 @@ Expected response:
 }
 ```
 
-If `data` is empty, run workflow 3 (profile intake) first. Otherwise:
-- Store `state.profile_id` ← `data[0].id` (in case it was missing).
-- Render the profile as a compact WeChat message: name, city, experience, top skills, desired role, active status.
+Store `state.profile_id` ← `data[0].id`. Render as a compact WeChat message (name, city, experience, top skills, desired role, active status).
+
+If `data` is empty → the server hasn't extracted enough yet. Route the owner back into workflow 2: "我还没收集够信息呢，聊聊你的背景？"
 
 ---
 
----
+## 9. Extract CV snapshot (optional)
 
-## 11. Search jobs
-
-**When:** owner asks "有什么工作", "搜深圳的后端", "search jobs in Beijing".
+**When:** owner says "看看简历整理成什么样", "确认简历", "show me what you've got on me".
 
 ```
-GET ${BASE}/jobs/search?city=深圳&job_type=full_time&industry=互联网&salary_min=20000&salary_max=50000&page=1&per_page=20
+GET ${BASE}/chat/extract-cv
 Authorization: Bearer ${state.session_token}
 ```
 
-All query params are optional. Extract whatever filters the owner mentioned from their natural-language query. Defaults: `page=1&per_page=10`.
+The backend reads the A2C agent's session memory and returns the current candidate draft — no LLM call, just a snapshot of what the server already has.
 
-Expected response:
-```json
-{
-  "data": [
-    {
-      "id": "job_1",
-      "title": "Java高级开发",
-      "company_name": "XX科技",
-      "city": "深圳",
-      "salary": "25K-40K",
-      "job_type": "full_time"
-    }
-  ],
-  "total": 42,
-  "page": 1,
-  "per_page": 10
-}
-```
-
-Render as a numbered WeChat message (keep it short):
-
-```
-🔍 找到 3 个匹配职位
-
-1. Java高级开发 — XX科技 · 深圳 · 25K-40K
-2. 产品经理 — 匿名 · 北京 · 30K-50K
-3. 数据标注员 — YY公司 · 东莞 · 日薪200
-
-想看哪个详情？回复数字。
-```
-
-Store `state.last_search_results` ← `data` (the array) so the owner can pick by index.
-
-If `data` is empty, say: "没找到匹配的职位，换个条件试试？"
-
----
-
-## 12. Job detail
-
-**When:** owner replies with a number after a search (workflow 11), or asks "第一个详情", "tell me more about job_1".
-
-Resolve the job id:
-- If the owner said a number, use `state.last_search_results[n-1].id`.
-- If they said an id, use it directly.
-
-```
-GET ${BASE}/jobs/${job_id}
-Authorization: Bearer ${state.session_token}
-```
-
-Expected response:
+Expected response (see `extractCVResponseFromSession` in `chat_proxy_handler.go:1366`):
 ```json
 {
   "data": {
-    "id": "job_1",
-    "title": "Java高级开发",
-    "company_name": "XX科技",
-    "description": "…",
-    "requirements": "…",
+    "message_count": 12,
+    "session_updated_at": "2026-04-13T…",
+    "summary": "…",
     "city": "深圳",
-    "salary": "25K-40K",
-    "benefits": []
+    "education": "本科",
+    "age": "28",
+    "current_title": "后端开发",
+    "current_company": "腾讯",
+    "skills": ["Python", "RAG"],
+    "desired_roles": ["AI应用开发"],
+    "desired_cities": ["深圳"],
+    "desired_salary": "25K",
+    "available_date": "immediately",
+    "deal_breakers": [],
+    "risk_signals": [],
+    "resume_text": "…"
   }
 }
 ```
 
-Render as a multi-line WeChat message. End with:
+Store as `state.latest_cv_snapshot`. Show a compact bulleted summary to the owner.
 
-> "感兴趣的话我帮你投递？回复「投递」。"
+If `data` is `{}` or missing most fields → conversation hasn't gone far enough; route back into workflow 2 for a few more turns.
 
-Store `state.active_job_id` ← `data.id`.
-
----
-
-## 13. List matches
-
-**When:** owner asks "我的匹配", "推荐岗位", "有什么匹配".
-
-```
-GET ${BASE}/candidates/${state.account_id}/matches?page=1&per_page=10
-Authorization: Bearer ${state.session_token}
-```
-
-Optional filter: `&status=pending|interested|applied|passed`.
-
-Expected response:
-```json
-{
-  "data": [
-    {
-      "id": "match_1",
-      "job": { "id": "job_1", "title": "…", "company_name": "…", "city": "…", "salary": "…" },
-      "score": 0.87,
-      "fit_code": "strong",
-      "status": "pending"
-    }
-  ],
-  "total": 5
-}
-```
-
-Render as a numbered list showing job title, company, fit score, and status. Store `state.last_matches` ← `data`.
-
-If `data` is empty:
-- If `state.profile_id` is empty or profile not activated → tell owner to run workflow 9 first.
-- Else → "还没有匹配，过阵子再来看看。"
+**Do NOT use this to drive a separate save step.** The profile is already auto-saved by the server after each workflow 2 turn. This endpoint is read-only.
 
 ---
 
-## 14. Update match status (interested / pass)
-
-**When:** owner reacts to a match from workflow 13 ("第一个感兴趣", "跳过第三个").
-
-Resolve `match_id` from `state.last_matches[n-1].id`.
-
-```
-PATCH ${BASE}/matches/${match_id}
-Authorization: Bearer ${state.session_token}
-Content-Type: application/json
-
-{ "status": "interested" }   // or "passed"
-```
-
-Expected response: `{ "data": { "id": "match_1", "status": "interested" } }`
-
-Say:
-- `interested` → "✅ 已标记为感兴趣。要不要现在投递？"
-- `passed` → "好，已跳过。"
-
-If `interested`, set `state.active_match_id` ← `match_id` and `state.active_job_id` ← `state.last_matches[n-1].job.id`. Then wait for the owner to confirm applying (workflow 15).
-
----
-
-## 15. Apply to a job (start recruiter conversation)
-
-**When:** owner explicitly says "投递", "申请", "apply" — either after a job detail (workflow 12) or a match (workflow 14).
-
-Requires: `state.active_job_id` set, and the owner's profile is activated (workflow 9). If not activated, prompt: "先激活简历招聘方才能看到你，现在激活？"
-
-```
-POST ${BASE}/conversations/initiate
-Authorization: Bearer ${state.session_token}
-Content-Type: application/json
-
-{ "job_id": "${state.active_job_id}" }
-```
-
-Expected response:
-```json
-{ "data": { "conversation_id": "conv_abc", "job_id": "job_1", "recruiter_id": "…" } }
-```
-
-If `state.active_match_id` is set, also run workflow 14 with `status: "applied"` to mark it.
-
-Say to owner:
-
-> "✅ 已投递！招聘方会在 ClawHire 收到你的简历。他们回消息后，请到网页「对话」页或 WeChat「我的对话」里查看并回复 —— WeChat 里面我只能帮你投递，后续的面谈请到对话页面。"
-
-Clear `state.active_job_id` and `state.active_match_id`.
-
-**Why we don't relay recruiter messages in WeChat:** recruiter↔candidate threads can be long, have attachments, and need async coordination. A WeChat proxy would either spam the owner or miss messages. Point them at the web app's 「对话」 tab.
-
----
-
-## 16. Account info
+## 10. Account info
 
 **When:** owner asks "我的账号", "account info".
 
@@ -602,13 +463,24 @@ Expected response:
 }
 ```
 
-Render as a short WeChat message. Do NOT echo the full phone number — mask it as `+86138****1111`.
+Render as a short WeChat message. **Mask the phone** as `+86138****1111` — do not echo the full number.
 
 ---
 
+## Dropped workflows (deliberately NOT included)
+
+These were in the original design but are now covered by workflow 2's structured response. Do NOT add them back without revisiting the spec:
+
+- ❌ `GET /jobs/search` — use workflow 2 (owner says "搜深圳的 Java" → chat returns `jobs` field).
+- ❌ `GET /jobs/:id` — job detail is embedded in `data.jobs[n].detail` from workflow 2.
+- ❌ `GET /candidates/:id/matches` — ranked matches arrive as `data.jobs` from workflow 2, already scored and enriched.
+- ❌ `PATCH /matches/:id` — no chat path for match status. The chat agent naturally moves on when the owner says "跳过".
+- ❌ `POST /conversations/initiate` — use workflow 5 (`action: "apply"` on chat endpoint) instead.
+- ❌ `POST /candidates/profiles`, most `PATCH /candidates/profiles/:id` — auto-synced by `syncCandidateProfile` after each chat turn (see `chat_proxy_handler.go:924`). The one PATCH that's still needed — the `active` toggle — is workflow 7.
+- ❌ `POST /chat/profile-intake/stream` — SSE incompatible with WeChat turn-based messaging.
+
 ## Non-goals (do NOT add workflows for these)
 
-- `POST /chat/profile-intake/stream` — SSE incompatible with WeChat turn-based chat. Use workflow 3 instead.
-- Recruiter↔candidate long-form messaging — handled by the web app's 「对话」 tab (see workflow 15 rationale).
+- Recruiter↔candidate long-form messaging — handled by the web app's 「对话」 tab.
 - Any recruiter-side endpoint (`/recruiter/*`, `/positions/*`). This skill is candidate-only.
-- Match score/report inspection endpoints beyond what workflow 13 returns.
+- Rendering `interactive` a2ui payloads in WeChat — always fall back to `content_list` text.

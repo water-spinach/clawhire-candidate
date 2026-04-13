@@ -2,6 +2,8 @@
 
 The `clawhire-candidate` skill does not persist state itself — openclaw's runtime memory (SQLite at `~/.openclaw/memory/main.sqlite`) does. This file defines the **contract**: what keys the workflows read from and write to, and why each matters. If a workflow step uses a state key not listed here, either the workflow or this file has a bug.
 
+The server owns most of what used to be state: the profile draft, the conversation history, the latest job deck, and the current phase all live server-side and arrive fresh in every workflow 2 response. That's why this list is short.
+
 ## Keys
 
 ### `session_token` (string, sensitive)
@@ -9,19 +11,19 @@ The `clawhire-candidate` skill does not persist state itself — openclaw's runt
 - **Source:** Response of workflow 1 step 3 (`/auth/sms/verify`).
 - **Why:** Every authed call needs it as `Authorization: Bearer ${session_token}`. Without it, every request returns 401.
 - **How to apply:** Send on every request except `/auth/sms/*`. On any 401 response, drop the value and re-run workflow 1.
-- **Rotation:** Tokens may expire server-side after an unspecified period — treat 401 as "time to re-auth", not an error.
+- **Rotation:** Tokens may expire server-side — treat 401 as "time to re-auth", not an error.
 
 ### `account_id` (string)
 
 - **Source:** `account.id` field of workflow 1 step 3 response.
-- **Why:** Workflow 13 (`GET /candidates/:id/matches`) requires it in the path.
-- **How to apply:** Substitute into match-list URLs. Do not confuse with `profile_id` — an account is the login identity, a profile is the CV.
+- **Why:** Used to namespace the server-side A2C session (the backend derives `session_id = "clawhire-a2c-" + account_id`). Also useful for future workflows that need the owner's account id in the path.
+- **How to apply:** Stash after verify. You don't put it in URLs — the server derives session IDs from the bearer token's account — but the agent may want to reference it for disambiguation in multi-account testing.
 
 ### `phone` (string, E.164)
 
 - **Source:** Either `CLAWHIRE_PHONE` env var or the owner's first reply in workflow 1 step 1.
 - **Why:** Needed to re-run workflow 1 after token expiry.
-- **How to apply:** Never share with recruiters, never echo in full back to the owner in other workflows (mask as `+86138****1111` when displaying in workflow 16).
+- **How to apply:** Never share with recruiters, never echo in full back to the owner in other workflows (mask as `+86138****1111` when displaying in workflow 10).
 
 ### `account_type` (constant: `"candidate"`)
 
@@ -30,30 +32,32 @@ The `clawhire-candidate` skill does not persist state itself — openclaw's runt
 
 ### `profile_id` (string, nullable)
 
-- **Source:** `data.id` field of workflow 8 step 1 response (POST), or `data[0].id` from workflow 10.
-- **Why:** PATCH calls in workflows 8/9 need the id in the URL. Also needed for pre-flight checks before workflow 15 (apply).
-- **How to apply:** Capture after the first successful save. If nullable and the owner wants to apply/activate, run workflow 10 first to fetch an existing profile, or workflow 3 to create one.
+- **Source:** `data[0].id` from workflow 8 (`GET /candidates/profiles?per_page=1`). The server auto-creates the profile during workflow 2; this key is only needed for the activation toggle in workflow 7.
+- **Why:** Workflow 7 (`PATCH /candidates/profiles/:id`) needs the id in the URL.
+- **How to apply:** Populate lazily — only when the owner asks to activate/deactivate. Don't fetch it up front.
 
 ### `latest_cv_snapshot` (object, nullable)
 
-- **Source:** Full response data of workflow 7 (`/chat/extract-cv`).
-- **Why:** Workflow 8 builds its save body from this snapshot without re-extracting. Also lets the agent diff between a new extract and the prior version to describe changes to the owner.
-- **How to apply:** Overwrite on every successful workflow 7 call. Clear only when the owner says "重新开始" / "start over" on their profile.
+- **Source:** Full response data of workflow 9 (`GET /chat/extract-cv`).
+- **Why:** Lets the agent show the owner what the server currently has on file without re-fetching every turn, and lets it diff against a later snapshot to describe changes.
+- **How to apply:** Overwrite on every successful workflow 9 call. Clear only when the owner says "重新开始" / "start over".
 
-### `active_job_id` / `active_match_id` (strings, nullable, transient)
+### `last_chat_jobs` (array, nullable, transient)
 
-- **Source:** Set by workflows 11/12 (search + detail) and workflow 14 (match interest).
-- **Why:** Workflow 15 (apply) needs to know which job the owner is currently looking at. Without this, the agent can't disambiguate "apply" / "投递" when the owner is several turns away from the original job-detail view.
-- **How to apply:** Set in workflows 12 (job detail) or 14 (match → interested). Clear after workflow 15 completes, or after 5 turns of unrelated conversation.
+- **Source:** `data.jobs` array from the most recent workflow 2 response.
+- **Why:** Lets the owner pick by index ("第一个详情", "投第二个") without the agent re-asking the server. Also lets workflow 5 (apply) resolve the target job without a separate lookup.
+- **How to apply:** Overwrite on every workflow 2 call that returns a non-empty `jobs`. Do NOT clear when jobs is empty — the server might be in a conversational phase between deck turns; hold onto the last deck until a new one arrives.
 
-### `last_search_results` / `last_matches` (arrays, nullable, transient)
+### `active_job_id` (string, nullable, transient)
 
-- **Source:** Workflow 11 (`/jobs/search`) and workflow 13 (`/candidates/:id/matches`) response arrays.
-- **Why:** Lets the owner pick by index ("第一个详情", "跳过第三个"). Without this, the agent has to re-query every time.
-- **How to apply:** Overwrite on every search/match call. Safe to clear after the user moves to an unrelated topic.
+- **Source:** Set by workflow 2 Step 3b (defaults to `last_chat_jobs[0].job_id`) or workflow 5 Step 1 (when the owner picks a specific index).
+- **Why:** Workflow 5 (apply) needs to know which job to send in the `action: "apply"` payload when the owner says just "投递" without specifying an index.
+- **How to apply:** Set whenever a fresh `jobs` list arrives. Clear after workflow 5 completes, or after 5 turns of unrelated conversation.
 
 ## What NOT to persist
 
 - **API key** (`data.api_key` from workflow 1 step 3) — only returned on first-time register; not needed by any workflow (all runtime auth uses `session_token`). If you do capture it, store it only at the openclaw memory layer, never echo it back in logs or messages.
-- **Full profile-intake conversation history** — the server owns this, the agent reads it on demand via workflow 6.
-- **Recruiter messages** — not handled by this skill at all (see workflow 15 rationale).
+- **Full profile-intake conversation history** — the server owns this. Re-fetch via workflow 6 on demand.
+- **The extracted candidate_profile from workflow 2 responses** — the server already persisted it to the DB via `syncCandidateProfile`. Holding a local copy just risks staleness. Use workflow 9 if you want a canonical read.
+- **Recruiter messages** — not handled by this skill at all (see workflow 5 rationale).
+- **Match statuses, match ids, ranked match lists** — no chat path for match CRUD. The `data.jobs` array from workflow 2 is the source of truth for "what should I apply to next"; everything else is server-owned.
